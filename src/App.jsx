@@ -3,13 +3,30 @@ import "./App.css";
 
 const WEBHOOK_URL = import.meta.env.VITE_N8N_WEBHOOK_URL || "";
 
-// The bulk flow is asynchronous: the POST kicks a job off and returns
-// immediately with a jobId. This is the status-polling endpoint,
-// derived from the same n8n webhook base path.
-const STATUS_URL = WEBHOOK_URL.replace(/\/?script-studio\/?$/, "/script-studio-status");
+// The bulk flow is asynchronous. The POST creates/persists a job and
+// returns a jobId. Status and download use sibling n8n webhook paths.
+function siblingWebhookUrl(pathName) {
+  const raw = WEBHOOK_URL.trim();
+  if (!raw) return "";
+
+  try {
+    const url = new URL(raw);
+    const slash = url.pathname.lastIndexOf("/");
+    url.pathname = `${url.pathname.slice(0, slash + 1)}${pathName}`;
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return raw.replace(/\/[^/]*\/?$/, `/${pathName}`);
+  }
+}
+
+const STATUS_URL = siblingWebhookUrl("script-studio-status");
+const DEFAULT_DOWNLOAD_URL = siblingWebhookUrl("script-studio-download");
 
 const POLL_INTERVAL_MS = 4000;
 const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes safety cutoff
+const JOB_LOOKUP_GRACE_MS = 90 * 1000; // allow n8n/data-table propagation
 
 const options = {
   intent: ["Create New Script", "Rewrite Existing Script"],
@@ -277,19 +294,6 @@ async function readResponse(response) {
   };
 }
 
-// Decode a base64 string (no data: prefix expected) into a Blob.
-function base64ToBlob(base64, mimeType) {
-  const byteChars = atob(base64);
-  const byteNumbers = new Array(byteChars.length);
-
-  for (let i = 0; i < byteChars.length; i++) {
-    byteNumbers[i] = byteChars.charCodeAt(i);
-  }
-
-  const byteArray = new Uint8Array(byteNumbers);
-  return new Blob([byteArray], { type: mimeType });
-}
-
 function downloadBlob(blob, fileName) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -416,6 +420,8 @@ export default function App() {
   };
 
   // Poll the status endpoint until the job completes, fails, or times out.
+  // A missing row is treated as transient because n8n may answer the first
+  // status request before the Data Table insert is visible.
   const pollBulkJob = async (jobId) => {
     const startedAt = Date.now();
     pollAbortRef.current = false;
@@ -423,50 +429,117 @@ export default function App() {
     while (!pollAbortRef.current) {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
         throw new Error(
-          "Timed out waiting for bulk generation. It may still finish in n8n — check there directly."
+          "Timed out waiting for bulk generation. The job may still be running in n8n."
         );
       }
 
       await sleep(POLL_INTERVAL_MS);
 
-      const statusResponse = await fetch(
-        `${STATUS_URL}?jobId=${encodeURIComponent(jobId)}`,
-        {
-          method: "GET",
-          headers: { Accept: "application/json" },
-        }
-      );
+      let statusResponse;
+      let parsed;
 
-      const parsed = await readResponse(statusResponse);
+      try {
+        statusResponse = await fetch(
+          `${STATUS_URL}?jobId=${encodeURIComponent(jobId)}`,
+          {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+          }
+        );
 
-      if (!statusResponse.ok || parsed.empty || !parsed.data) {
-        // Transient hiccup — keep polling rather than failing immediately.
+        parsed = await readResponse(statusResponse);
+      } catch {
+        // Network/CORS hiccup: keep polling until the overall timeout.
         continue;
       }
 
-      const data = parsed.data;
+      if (!statusResponse.ok || parsed.empty || !parsed.data) {
+        continue;
+      }
 
+      const data = normaliseResponse(parsed.data);
+      const elapsed = Date.now() - startedAt;
+
+      // "Unknown or expired jobId" immediately after creation is not fatal.
+      // Give the Data Table time to become visible to the status webhook.
       if (data.success === false) {
-        throw new Error(data.error || "Lost track of the bulk job.");
+        if (elapsed < JOB_LOOKUP_GRACE_MS || data.retryable) {
+          setBulkProgress((previous) => ({
+            totalRows: previous?.totalRows || data.totalRows || 0,
+            status: "processing",
+          }));
+          continue;
+        }
+
+        throw new Error(data.error || "Bulk job could not be found.");
       }
 
       setBulkProgress({
-        totalRows: data.totalRows,
-        status: data.status,
+        totalRows: Number(data.totalRows || 0),
+        status: data.status || "processing",
       });
 
-      if (data.status === "completed") {
+      if (String(data.status || "").toLowerCase() === "completed") {
         return data;
       }
 
-      if (data.status === "failed") {
+      if (String(data.status || "").toLowerCase() === "failed") {
         throw new Error(data.error || "Bulk generation failed in n8n.");
       }
-
-      // status === "processing" -> keep polling
     }
 
     throw new Error("Polling was cancelled.");
+  };
+
+  const downloadBulkResult = async (job) => {
+    const downloadUrl = job?.downloadPath
+      ? new URL(job.downloadPath, WEBHOOK_URL).toString()
+      : `${DEFAULT_DOWNLOAD_URL}?jobId=${encodeURIComponent(job.jobId)}`;
+
+    const response = await fetch(downloadUrl, {
+      method: "GET",
+      headers: { Accept: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream" },
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      let message = `Download failed (${response.status}).`;
+
+      try {
+        const parsed = await readResponse(response);
+        const data = normaliseResponse(parsed.data);
+        message = data?.error || data?.message || message;
+      } catch {
+        // Keep the HTTP error message.
+      }
+
+      throw new Error(message);
+    }
+
+    const blob = await response.blob();
+
+    if (!blob.size) {
+      throw new Error("n8n returned an empty XLSX file.");
+    }
+
+    let fileName = job.fileName || "script-results.xlsx";
+    const disposition = response.headers.get("content-disposition") || "";
+
+    const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
+
+    if (utf8Match?.[1]) {
+      try {
+        fileName = decodeURIComponent(utf8Match[1]);
+      } catch {
+        fileName = utf8Match[1];
+      }
+    } else if (plainMatch?.[1]) {
+      fileName = plainMatch[1];
+    }
+
+    downloadBlob(blob, fileName);
   };
 
   const runBulk = async () => {
@@ -485,6 +558,12 @@ export default function App() {
       return;
     }
 
+    const lowerName = file.name.toLowerCase();
+    if (!lowerName.endsWith(".csv") && !lowerName.endsWith(".xlsx")) {
+      setError("Only CSV and XLSX files are supported.");
+      return;
+    }
+
     setLoading(true);
 
     try {
@@ -492,11 +571,13 @@ export default function App() {
 
       fd.append("inputMode", "bulk");
       fd.append("bulkDefaultSaveScriptTo", form.saveScriptTo);
-      fd.append("file", file);
 
-      // Step 1: kick the job off. n8n responds immediately with a jobId
-      // instead of waiting for all rows to finish — avoids the browser's
-      // HTTP connection timing out on long bulk runs.
+      // IMPORTANT: the n8n gateway expects the multipart field to be named
+      // exactly "file".
+      fd.append("file", file, file.name);
+
+      // Step 1: create/persist the job. The gateway responds with jobId
+      // before the expensive row generation finishes.
       const response = await fetch(WEBHOOK_URL, {
         method: "POST",
         body: fd,
@@ -508,67 +589,61 @@ export default function App() {
       const parsed = await readResponse(response);
 
       if (!response.ok) {
+        const data = normaliseResponse(parsed.data);
         const message =
-          parsed.data?.error ||
-          parsed.data?.message ||
+          data?.error ||
+          data?.message ||
           `Bulk request failed (${response.status}).`;
         throw new Error(message);
       }
 
       if (parsed.empty || !parsed.data) {
         throw new Error(
-          "n8n returned an empty response when starting the bulk job."
+          "n8n returned an empty response when starting the bulk job. Make sure the imported gateway is ACTIVE and its Webhook Response mode is 'Using Respond to Webhook Node'."
         );
       }
 
-      if (parsed.data.success === false) {
+      const startData = normaliseResponse(parsed.data);
+
+      if (startData.success === false) {
         throw new Error(
-          parsed.data.error || "n8n rejected the bulk request."
+          startData.error || "n8n rejected the bulk request."
         );
       }
 
-      const jobId = parsed.data.jobId;
+      const jobId = startData.jobId;
 
       if (!jobId) {
         throw new Error(
-          "n8n did not return a jobId. Check the 'Respond — Bulk Job Created' node."
+          "n8n did not return a jobId. Re-import the fixed gateway and make sure 'Respond — Bulk Job Created' is connected."
         );
       }
 
-      // The job can already be "failed" on the very first response (e.g.
-      // an uploaded file with a header row but no data rows) — no point
-      // waiting through a poll cycle to find that out.
-      if (parsed.data.status === "failed") {
+      if (String(startData.status || "").toLowerCase() === "failed") {
         throw new Error(
-          parsed.data.error || "Bulk generation failed before it could start."
+          startData.error || "Bulk generation failed before it could start."
         );
       }
 
       setBulkProgress({
-        totalRows: parsed.data.totalRows,
+        totalRows: Number(startData.totalRows || 0),
         status: "processing",
       });
 
-      // Step 2: poll until the job is done, then download the file.
+      // Step 2: poll the persistent Data Table job record.
       const finalStatus = await pollBulkJob(jobId);
 
-      if (!finalStatus.resultBase64) {
-        throw new Error("Job completed, but no file was returned.");
-      }
-
-      const blob = base64ToBlob(
-        finalStatus.resultBase64,
-        finalStatus.mimeType ||
-          "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      );
-
-      downloadBlob(blob, finalStatus.fileName || "script-results.xlsx");
+      // Step 3: download the real XLSX binary from n8n.
+      // We deliberately do NOT use atob()/base64 in the browser.
+      await downloadBulkResult(finalStatus);
 
       setBulkDone(true);
+      setBulkProgress(null);
     } catch (e) {
       setError(e?.message || "Bulk request failed.");
     } finally {
       setLoading(false);
+      // Keep the final success message visible, but remove the spinner.
       setBulkProgress(null);
     }
   };
