@@ -321,6 +321,10 @@ export default function App() {
   const [bulkDone, setBulkDone] = useState(false);
   const [bulkProgress, setBulkProgress] = useState(null); // { totalRows, status }
   const pollAbortRef = useRef(false);
+  // Extra guard on top of `disabled={loading}` so a double-click or a
+  // duplicate React event (e.g. StrictMode double-invoke) can never fire
+  // two submissions before the first setLoading(true) re-render lands.
+  const submitInFlightRef = useRef(false);
 
   useEffect(() => {
     return () => {
@@ -338,16 +342,21 @@ export default function App() {
   const valid = useMemo(() => Boolean(WEBHOOK_URL.trim()), []);
 
   const runManual = async () => {
+    if (submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
+
     setError("");
     setResult(null);
     setBulkDone(false);
 
     if (!WEBHOOK_URL.trim()) {
+      submitInFlightRef.current = false;
       setError("Set VITE_N8N_WEBHOOK_URL in frontend/.env first.");
       return;
     }
 
     if (!form.idea.trim()) {
+      submitInFlightRef.current = false;
       setError("Idea is required.");
       return;
     }
@@ -416,6 +425,7 @@ export default function App() {
       setError(e?.message || "Request failed.");
     } finally {
       setLoading(false);
+      submitInFlightRef.current = false;
     }
   };
 
@@ -543,23 +553,29 @@ export default function App() {
   };
 
   const runBulk = async () => {
+    if (submitInFlightRef.current) return;
+    submitInFlightRef.current = true;
+
     setError("");
     setResult(null);
     setBulkDone(false);
     setBulkProgress(null);
 
     if (!WEBHOOK_URL.trim()) {
+      submitInFlightRef.current = false;
       setError("Set VITE_N8N_WEBHOOK_URL in frontend/.env first.");
       return;
     }
 
     if (!file) {
+      submitInFlightRef.current = false;
       setError("Choose a CSV or XLSX file.");
       return;
     }
 
     const lowerName = file.name.toLowerCase();
     if (!lowerName.endsWith(".csv") && !lowerName.endsWith(".xlsx")) {
+      submitInFlightRef.current = false;
       setError("Only CSV and XLSX files are supported.");
       return;
     }
@@ -645,6 +661,7 @@ export default function App() {
       setLoading(false);
       // Keep the final success message visible, but remove the spinner.
       setBulkProgress(null);
+      submitInFlightRef.current = false;
     }
   };
 
