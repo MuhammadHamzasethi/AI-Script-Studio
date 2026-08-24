@@ -3,8 +3,6 @@ import "./App.css";
 
 const WEBHOOK_URL = import.meta.env.VITE_N8N_WEBHOOK_URL || "";
 
-// The bulk flow is asynchronous. The POST creates/persists a job and
-// returns a jobId. Status and download use sibling n8n webhook paths.
 function siblingWebhookUrl(pathName) {
   const raw = WEBHOOK_URL.trim();
   if (!raw) return "";
@@ -24,9 +22,29 @@ function siblingWebhookUrl(pathName) {
 const STATUS_URL = siblingWebhookUrl("script-studio-status");
 const DEFAULT_DOWNLOAD_URL = siblingWebhookUrl("script-studio-download");
 
-const POLL_INTERVAL_MS = 4000;
-const POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes safety cutoff
-const JOB_LOOKUP_GRACE_MS = 90 * 1000; // allow n8n/data-table propagation
+const POLL_INTERVAL_START_MS = 6000;
+const POLL_INTERVAL_MAX_MS = 20000;
+const POLL_BACKOFF_AFTER_POLLS = 5;
+const POLL_TIMEOUT_MS = 20 * 60 * 1000;
+const JOB_LOOKUP_GRACE_MS = 90 * 1000;
+const FETCH_TIMEOUT_MS = 20000;
+const MAX_NETWORK_RETRIES_PER_POLL = 3;
+
+function pollIntervalForAttempt(attempt) {
+  if (attempt <= POLL_BACKOFF_AFTER_POLLS) return POLL_INTERVAL_START_MS;
+  return POLL_INTERVAL_MAX_MS;
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 const options = {
   intent: ["Create New Script", "Rewrite Existing Script"],
@@ -157,19 +175,6 @@ function SelectField({ label, value, onChange, items }) {
   );
 }
 
-/*
-  n8n can return the script in several shapes depending on how the
-  Respond to Webhook node is configured.
-
-  Supported examples:
-
-  1. { status: "success", script: {...}, analysis: {...} }
-  2. { success: true, data: { status: "success", script: {...} } }
-  3. { result: {...} }
-  4. [{ status: "success", script: {...} }]
-
-  This function normalises all of them so the UI does not break.
-*/
 function normaliseResponse(value) {
   let data = value;
 
@@ -205,17 +210,34 @@ function getScriptData(value) {
   return data;
 }
 
+// Deeply searches and extracts fullScript or finalText regardless of nesting
 function getFullScript(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
 
-  return (
-    script?.fullScript ||
-    data?.fullScript ||
-    data?.finalText ||
-    script?.finalText ||
-    ""
-  );
+  const candidates = [
+    script?.fullScript,
+    script?.finalText,
+    script?.script,
+    script?.full_script,
+    script?.scriptText,
+    data?.fullScript,
+    data?.finalText,
+    data?.script,
+    data?.full_script,
+    data?.output?.script?.fullScript,
+    data?.output?.script?.finalText,
+    data?.output?.fullScript,
+    data?.output?.finalText,
+  ];
+
+  for (const item of candidates) {
+    if (typeof item === "string" && item.trim().length > 0) {
+      return item.trim();
+    }
+  }
+
+  return "";
 }
 
 function getAnalysis(value) {
@@ -229,11 +251,7 @@ function getAlternativeHooks(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
 
-  return (
-    data?.alternativeHooks ||
-    script?.alternativeHooks ||
-    []
-  );
+  return data?.alternativeHooks || script?.alternativeHooks || [];
 }
 
 function getVisualBeats(value) {
@@ -243,17 +261,6 @@ function getVisualBeats(value) {
   return data?.visualBeats || script?.visualBeats || [];
 }
 
-/*
-  Important:
-  Do NOT call response.json() directly.
-
-  If n8n sends an empty response, response.json() throws:
-  "Failed to execute 'json' on 'Response':
-   Unexpected end of JSON input"
-
-  We first read the response as text, then JSON.parse only when
-  there is actually content.
-*/
 async function readResponse(response) {
   const text = await response.text();
   const contentType = response.headers.get("content-type") || "";
@@ -319,16 +326,12 @@ export default function App() {
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [bulkDone, setBulkDone] = useState(false);
-  const [bulkProgress, setBulkProgress] = useState(null); // { totalRows, status }
+  const [bulkProgress, setBulkProgress] = useState(null);
   const pollAbortRef = useRef(false);
-  // Extra guard on top of `disabled={loading}` so a double-click or a
-  // duplicate React event (e.g. StrictMode double-invoke) can never fire
-  // two submissions before the first setLoading(true) re-render lands.
   const submitInFlightRef = useRef(false);
 
   useEffect(() => {
     return () => {
-      // Stop polling if the component unmounts mid-job.
       pollAbortRef.current = true;
     };
   }, []);
@@ -429,12 +432,12 @@ export default function App() {
     }
   };
 
-  // Poll the status endpoint until the job completes, fails, or times out.
-  // A missing row is treated as transient because n8n may answer the first
-  // status request before the Data Table insert is visible.
   const pollBulkJob = async (jobId) => {
     const startedAt = Date.now();
     pollAbortRef.current = false;
+
+    let attempt = 0;
+    let consecutiveNetworkFailures = 0;
 
     while (!pollAbortRef.current) {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
@@ -443,13 +446,14 @@ export default function App() {
         );
       }
 
-      await sleep(POLL_INTERVAL_MS);
+      attempt += 1;
+      await sleep(pollIntervalForAttempt(attempt));
 
       let statusResponse;
       let parsed;
 
       try {
-        statusResponse = await fetch(
+        statusResponse = await fetchWithTimeout(
           `${STATUS_URL}?jobId=${encodeURIComponent(jobId)}`,
           {
             method: "GET",
@@ -459,8 +463,18 @@ export default function App() {
         );
 
         parsed = await readResponse(statusResponse);
+        consecutiveNetworkFailures = 0;
       } catch {
-        // Network/CORS hiccup: keep polling until the overall timeout.
+        consecutiveNetworkFailures += 1;
+
+        if (consecutiveNetworkFailures >= MAX_NETWORK_RETRIES_PER_POLL) {
+          setBulkProgress((previous) => ({
+            totalRows: previous?.totalRows || 0,
+            status: "processing",
+            networkWarning: true,
+          }));
+        }
+
         continue;
       }
 
@@ -471,8 +485,6 @@ export default function App() {
       const data = normaliseResponse(parsed.data);
       const elapsed = Date.now() - startedAt;
 
-      // "Unknown or expired jobId" immediately after creation is not fatal.
-      // Give the Data Table time to become visible to the status webhook.
       if (data.success === false) {
         if (elapsed < JOB_LOOKUP_GRACE_MS || data.retryable) {
           setBulkProgress((previous) => ({
@@ -507,11 +519,22 @@ export default function App() {
       ? new URL(job.downloadPath, WEBHOOK_URL).toString()
       : `${DEFAULT_DOWNLOAD_URL}?jobId=${encodeURIComponent(job.jobId)}`;
 
-    const response = await fetch(downloadUrl, {
-      method: "GET",
-      headers: { Accept: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream" },
-      cache: "no-store",
-    });
+    let response;
+    try {
+      response = await fetchWithTimeout(
+        downloadUrl,
+        {
+          method: "GET",
+          headers: { Accept: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream" },
+          cache: "no-store",
+        },
+        60000
+      );
+    } catch {
+      throw new Error(
+        "Could not reach n8n to download the file (connection timed out or was blocked)."
+      );
+    }
 
     if (!response.ok) {
       let message = `Download failed (${response.status}).`;
@@ -521,7 +544,7 @@ export default function App() {
         const data = normaliseResponse(parsed.data);
         message = data?.error || data?.message || message;
       } catch {
-        // Keep the HTTP error message.
+        // Keep HTTP error message
       }
 
       throw new Error(message);
@@ -587,13 +610,8 @@ export default function App() {
 
       fd.append("inputMode", "bulk");
       fd.append("bulkDefaultSaveScriptTo", form.saveScriptTo);
-
-      // IMPORTANT: the n8n gateway expects the multipart field to be named
-      // exactly "file".
       fd.append("file", file, file.name);
 
-      // Step 1: create/persist the job. The gateway responds with jobId
-      // before the expensive row generation finishes.
       const response = await fetch(WEBHOOK_URL, {
         method: "POST",
         body: fd,
@@ -615,7 +633,7 @@ export default function App() {
 
       if (parsed.empty || !parsed.data) {
         throw new Error(
-          "n8n returned an empty response when starting the bulk job. Make sure the imported gateway is ACTIVE and its Webhook Response mode is 'Using Respond to Webhook Node'."
+          "n8n returned an empty response when starting the bulk job."
         );
       }
 
@@ -630,9 +648,7 @@ export default function App() {
       const jobId = startData.jobId;
 
       if (!jobId) {
-        throw new Error(
-          "n8n did not return a jobId. Re-import the fixed gateway and make sure 'Respond — Bulk Job Created' is connected."
-        );
+        throw new Error("n8n did not return a jobId.");
       }
 
       if (String(startData.status || "").toLowerCase() === "failed") {
@@ -646,11 +662,7 @@ export default function App() {
         status: "processing",
       });
 
-      // Step 2: poll the persistent Data Table job record.
       const finalStatus = await pollBulkJob(jobId);
-
-      // Step 3: download the real XLSX binary from n8n.
-      // We deliberately do NOT use atob()/base64 in the browser.
       await downloadBulkResult(finalStatus);
 
       setBulkDone(true);
@@ -659,7 +671,6 @@ export default function App() {
       setError(e?.message || "Bulk request failed.");
     } finally {
       setLoading(false);
-      // Keep the final success message visible, but remove the spinner.
       setBulkProgress(null);
       submitInFlightRef.current = false;
     }
@@ -768,8 +779,7 @@ export default function App() {
             Generating{" "}
             {bulkProgress.totalRows ? bulkProgress.totalRows : ""} script
             {bulkProgress.totalRows === 1 ? "" : "s"}... this can take a
-            few minutes for larger sheets. Feel free to leave this tab
-            open — it'll keep checking automatically.
+            few minutes for larger sheets.
           </div>
         )}
 
@@ -821,8 +831,7 @@ export default function App() {
                   />
                 </Field>
 
-                {form.intent ===
-                  "Rewrite Existing Script" && (
+                {form.intent === "Rewrite Existing Script" && (
                   <Field
                     label="Existing Script (only if improving / rewriting)"
                     full
@@ -976,7 +985,7 @@ export default function App() {
                         e.target.value
                       )
                     }
-                    placeholder="Optional transcript or captions from the reference video..."
+                    placeholder="Optional transcript..."
                   />
                 </Field>
 
@@ -996,9 +1005,7 @@ export default function App() {
                 disabled={loading}
               >
                 {loading && <span className="spinner" />}
-                {loading
-                  ? "Generating..."
-                  : "Generate Script"}
+                {loading ? "Generating..." : "Generate Script"}
               </button>
             </section>
 
@@ -1012,7 +1019,15 @@ export default function App() {
                     </div>
 
                     <div className="score-row">
-                      <div className="score-ring" style={{ "--pct": Math.min(100, Math.max(0, analysis?.overallScore ?? 0)) }}>
+                      <div
+                        className="score-ring"
+                        style={{
+                          "--pct": Math.min(
+                            100,
+                            Math.max(0, analysis?.overallScore ?? 0)
+                          ),
+                        }}
+                      >
                         <span>{analysis?.overallScore ?? 0}</span>
                       </div>
                       <span className="muted">out of 100</span>
@@ -1020,36 +1035,23 @@ export default function App() {
                   </div>
 
                   <div className="actions">
-                    <button onClick={copyScript}>
-                      Copy Script
-                    </button>
-
-                    <button onClick={downloadTxt}>
-                      Download TXT
-                    </button>
+                    <button onClick={copyScript}>Copy Script</button>
+                    <button onClick={downloadTxt}>Download TXT</button>
                   </div>
                 </div>
 
                 <div className="script-box">
                   <span className="pin" aria-hidden="true" />
-                  <div className="label">
-                    SCRIPT
-                  </div>
-
+                  <div className="label">SCRIPT</div>
                   <pre>{fullScript}</pre>
                 </div>
 
                 {alternativeHooks.length > 0 && (
                   <div className="sub-card">
-                    <div className="label">
-                      ALTERNATIVE HOOKS
-                    </div>
+                    <div className="label">ALTERNATIVE HOOKS</div>
 
                     {alternativeHooks.map((x, i) => (
-                      <div
-                        className="line-item"
-                        key={i}
-                      >
+                      <div className="line-item" key={i}>
                         <span className="line-num">{i + 1}</span> {x}
                       </div>
                     ))}
@@ -1058,22 +1060,12 @@ export default function App() {
 
                 {visualBeats.length > 0 && (
                   <div className="sub-card">
-                    <div className="label">
-                      VISUAL IDEAS
-                    </div>
+                    <div className="label">VISUAL IDEAS</div>
 
                     {visualBeats.map((x, i) => (
-                      <div
-                        className="line-item"
-                        key={i}
-                      >
-                        <b>
-                          {x?.line || ""}
-                        </b>
-
-                        <span>
-                          {x?.visual || ""}
-                        </span>
+                      <div className="line-item" key={i}>
+                        <b>{x?.line || ""}</b>
+                        <span>{x?.visual || ""}</span>
                       </div>
                     ))}
                   </div>
@@ -1089,13 +1081,7 @@ export default function App() {
             </div>
 
             <p className="muted">
-              Upload a CSV or XLSX where each row is one
-              script request. A Google Sheet can be
-              exported as XLSX/CSV and uploaded here.
-              Larger sheets run in the background — this
-              page will keep checking on progress and
-              start the download automatically when it's
-              ready.
+              Upload a CSV or XLSX where each row is one script request.
             </p>
 
             <div className="upload">
@@ -1103,51 +1089,31 @@ export default function App() {
                 id="file"
                 type="file"
                 accept=".csv,.xlsx"
-                onChange={(e) =>
-                  setFile(
-                    e.target.files?.[0] || null
-                  )
-                }
+                onChange={(e) => setFile(e.target.files?.[0] || null)}
               />
 
               <label htmlFor="file">
-                <span className="upload-icon" aria-hidden="true">⏏</span>
-                {file
-                  ? file.name
-                  : "Choose CSV or XLSX"}
+                <span className="upload-icon" aria-hidden="true">
+                  ⏏
+                </span>
+                {file ? file.name : "Choose CSV or XLSX"}
               </label>
             </div>
 
             <SelectField
               label="Default Save Script To"
               value={form.saveScriptTo}
-              onChange={(v) =>
-                set("saveScriptTo", v)
-              }
+              onChange={(v) => set("saveScriptTo", v)}
               items={options.saveTo}
             />
 
             <div className="bulk-note">
               <b>Minimum column:</b> Idea
-              <br />
-              <b>Optional:</b> Niche, Platform,
-              Duration, TargetAudience, Market,
-              Language, ScriptStyle, CreatorPersonality,
-              Tone, Energy, CurrentTrends, Research,
-              ExistingScript, ReferenceVideoUrl,
-              ReferenceTranscript, ReferenceAnalysisFocus,
-              SaveScriptTo
             </div>
 
-            <button
-              className="primary"
-              onClick={runBulk}
-              disabled={loading}
-            >
+            <button className="primary" onClick={runBulk} disabled={loading}>
               {loading && <span className="spinner" />}
-              {loading
-                ? "Generating all scripts..."
-                : "Generate All Scripts"}
+              {loading ? "Generating all scripts..." : "Generate All Scripts"}
             </button>
           </section>
         )}
