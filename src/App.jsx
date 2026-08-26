@@ -127,16 +127,16 @@ const options = {
   saveTo: ["Abdul Hadi", "Taabish", "Random Account"],
 };
 
-// Script Style is multi-select: allow as many as there are options.
+// Multi-select configurations
+const NICHE_MAX = options.niche.length;
 const SCRIPT_STYLE_MAX = options.scriptStyle.length;
-// Reference Analysis Focus is multi-select so more than one lens (e.g. Hook + CTA)
-// can be requested when analysing a reference video.
+const CREATOR_PERSONALITY_MAX = options.creatorPersonality.length;
 const REFERENCE_FOCUS_MAX = 3;
 
 const defaults = {
   intent: "Create New Script",
   contentType: "Instagram Reel",
-  niche: "Technology",
+  niche: ["Technology"],
   idea: "",
   existingScript: "",
   platform: "Instagram Reels",
@@ -145,7 +145,7 @@ const defaults = {
   market: "Pakistan",
   language: "Natural Pakistani Roman Urdu + English",
   scriptStyle: ["Educational"],
-  creatorPersonality: "Funny/Sarcastic",
+  creatorPersonality: ["Funny/Sarcastic"],
   tone: "Casual",
   energy: "High",
   showAlternatives: "Yes",
@@ -181,10 +181,6 @@ function SelectField({ label, value, onChange, items }) {
   );
 }
 
-// Chip-style multi-select. Values is always an array. Enforces a max pick count
-// (silently ignores further clicks once the cap is hit) and always keeps at
-// least one item selected once the user has picked one, up to the caller to
-// validate a fully-empty state before submit.
 function MultiSelectField({ label, values, onChange, items, max = 3, hint, full = false }) {
   const toggle = (item) => {
     const isActive = values.includes(item);
@@ -280,7 +276,6 @@ function getScriptData(value) {
   return data;
 }
 
-// Deeply searches and extracts fullScript or finalText regardless of nesting
 function getFullScript(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
@@ -434,9 +429,21 @@ export default function App() {
       return;
     }
 
+    if (!Array.isArray(form.niche) || form.niche.length === 0) {
+      submitInFlightRef.current = false;
+      setError("Pick at least one Niche.");
+      return;
+    }
+
     if (!Array.isArray(form.scriptStyle) || form.scriptStyle.length === 0) {
       submitInFlightRef.current = false;
       setError("Pick at least one Script Style.");
+      return;
+    }
+
+    if (!Array.isArray(form.creatorPersonality) || form.creatorPersonality.length === 0) {
+      submitInFlightRef.current = false;
+      setError("Pick at least one Creator Personality.");
       return;
     }
 
@@ -890,11 +897,14 @@ export default function App() {
                   items={options.contentType}
                 />
 
-                <SelectField
+                <MultiSelectField
                   label="Niche"
-                  value={form.niche}
+                  values={form.niche}
                   onChange={(v) => set("niche", v)}
                   items={options.niche}
+                  max={NICHE_MAX}
+                  full
+                  hint="Pick as many as you want"
                 />
 
                 <Field label="Idea" full>
@@ -976,13 +986,14 @@ export default function App() {
                   }
                 />
 
-                <SelectField
+                <MultiSelectField
                   label="Creator Personality"
-                  value={form.creatorPersonality}
-                  onChange={(v) =>
-                    set("creatorPersonality", v)
-                  }
+                  values={form.creatorPersonality}
+                  onChange={(v) => set("creatorPersonality", v)}
                   items={options.creatorPersonality}
+                  max={CREATOR_PERSONALITY_MAX}
+                  full
+                  hint="Pick as many as you want"
                 />
 
                 <SelectField
