@@ -1,12 +1,12 @@
-import { useMemo, useState, useRef, useEffect } from "react";
+import { useMemo, useState, useRef, useEffect, useCallback } from "react";
 import "./App.css";
 
+/* ─────────────────── WEBHOOK CONFIG ─────────────────── */
 const WEBHOOK_URL = import.meta.env.VITE_N8N_WEBHOOK_URL || "";
 
 function siblingWebhookUrl(pathName) {
   const raw = WEBHOOK_URL.trim();
   if (!raw) return "";
-
   try {
     const url = new URL(raw);
     const slash = url.pathname.lastIndexOf("/");
@@ -22,23 +22,27 @@ function siblingWebhookUrl(pathName) {
 const STATUS_URL = siblingWebhookUrl("script-studio-status");
 const DEFAULT_DOWNLOAD_URL = siblingWebhookUrl("script-studio-download");
 
-const POLL_INTERVAL_START_MS = 6000;
-const POLL_INTERVAL_MAX_MS = 20000;
+/* ─────────────────── TIMING CONFIG ─────────────────── */
+const MANUAL_TIMEOUT_MS = 180_000;       // 3 min for script generation
+const POLL_INTERVAL_START_MS = 6_000;
+const POLL_INTERVAL_MAX_MS = 20_000;
 const POLL_BACKOFF_AFTER_POLLS = 5;
 const POLL_TIMEOUT_MS = 20 * 60 * 1000;
-const JOB_LOOKUP_GRACE_MS = 90 * 1000;
-const FETCH_TIMEOUT_MS = 20000;
-const MAX_NETWORK_RETRIES_PER_POLL = 3;
+const JOB_LOOKUP_GRACE_MS = 90_000;
+const FETCH_TIMEOUT_MS = 25_000;
+const MAX_NETWORK_RETRIES = 3;
+const RETRY_DELAY_MS = 3_000;
 
 function pollIntervalForAttempt(attempt) {
-  if (attempt <= POLL_BACKOFF_AFTER_POLLS) return POLL_INTERVAL_START_MS;
-  return POLL_INTERVAL_MAX_MS;
+  return attempt <= POLL_BACKOFF_AFTER_POLLS
+    ? POLL_INTERVAL_START_MS
+    : POLL_INTERVAL_MAX_MS;
 }
 
+/* ─────────────────── FETCH WITH TIMEOUT + RETRY ─────────────────── */
 async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
     return await fetch(url, { ...options, signal: controller.signal });
   } finally {
@@ -46,88 +50,59 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS)
   }
 }
 
+async function fetchWithRetry(url, options = {}, timeoutMs = FETCH_TIMEOUT_MS, maxRetries = MAX_NETWORK_RETRIES) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetchWithTimeout(url, options, timeoutMs);
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        await sleep(RETRY_DELAY_MS * (attempt + 1));
+      }
+    }
+  }
+  throw lastError;
+}
+
+/* ─────────────────── OPTIONS ─────────────────── */
 const options = {
   intent: ["Create New Script", "Rewrite Existing Script"],
   contentType: ["Instagram Reel", "Short Video", "Long Video"],
   niche: [
-    "Real Estate",
-    "Entertainment",
-    "Finance",
-    "Business",
-    "Marketing",
-    "Technology",
-    "Education",
-    "Fitness",
-    "Lifestyle",
-    "Personal Brand",
-    "Other",
+    "Real Estate", "Entertainment", "Finance", "Business", "Marketing",
+    "Technology", "Education", "Fitness", "Lifestyle", "Personal Brand", "Other",
   ],
   platform: ["Instagram Reels", "TikTok", "YouTube Shorts"],
   duration: [
-    "15 seconds",
-    "30 seconds",
-    "45 seconds",
-    "60 seconds",
-    "90 seconds",
-    "3 minutes",
-    "5 minutes",
-    "10 minutes",
+    "15 seconds", "30 seconds", "45 seconds", "60 seconds",
+    "90 seconds", "3 minutes", "5 minutes", "10 minutes",
   ],
   targetAudience: ["Gen Z", "General"],
   market: ["Pakistan", "India", "Global", "Other"],
   language: [
     "Natural Pakistani Roman Urdu + English",
-    "Pure Roman Urdu",
+    "Pure Roman Urdu + English",
     "Urdu + English",
     "English",
   ],
   scriptStyle: [
-    "Educational",
-    "Storytelling",
-    "Problem to Solution",
-    "Myth Busting",
-    "Listicle",
-    "Authority",
-    "Casual",
-    "Controversial",
-    "News/Trend",
+    "Educational", "Storytelling", "Problem to Solution", "Myth Busting",
+    "Listicle", "Authority", "Casual", "Controversial", "News/Trend",
   ],
   creatorPersonality: [
-    "Friendly Expert",
-    "Straight Talker",
-    "Teacher",
-    "Storyteller",
-    "Young Entrepreneur",
-    "Real Estate Expert",
-    "Funny/Sarcastic",
-    "Premium/Luxury",
+    "Friendly Expert", "Straight Talker", "Teacher", "Storyteller",
+    "Young Entrepreneur", "Real Estate Expert", "Funny/Sarcastic", "Premium/Luxury",
   ],
-  tone: [
-    "Casual",
-    "Friendly",
-    "Serious",
-    "Bold",
-    "Emotional",
-    "Funny",
-    "Conversational",
-  ],
+  tone: ["Casual", "Friendly", "Serious", "Bold", "Emotional", "Funny", "Conversational"],
   energy: ["Calm", "Natural", "Medium", "High", "Viral"],
   yesNo: ["Yes", "No"],
   trend: ["Off", "Relevant Only", "Smart Mode", "Heavy Trend"],
   research: ["Off", "Basic", "Deep"],
-  referenceFocus: [
-    "Hook",
-    "Structure",
-    "Tone",
-    "Pacing",
-    "Storytelling",
-    "Language",
-    "CTA",
-  ],
+  referenceFocus: ["Hook", "Structure", "Tone", "Pacing", "Storytelling", "Language", "CTA"],
   saveTo: ["Abdul Hadi", "Taabish", "Random Account"],
 };
 
-// Multi-select configurations
 const NICHE_MAX = options.niche.length;
 const SCRIPT_STYLE_MAX = options.scriptStyle.length;
 const CREATOR_PERSONALITY_MAX = options.creatorPersonality.length;
@@ -157,6 +132,19 @@ const defaults = {
   saveScriptTo: "Abdul Hadi",
 };
 
+/* ─────────────────── PROGRESS STAGES ─────────────────── */
+const PROGRESS_STAGES = [
+  { after: 0, text: "Analyzing your brief..." },
+  { after: 5_000, text: "Researching the topic..." },
+  { after: 15_000, text: "Building creative strategy..." },
+  { after: 30_000, text: "Writing the script..." },
+  { after: 50_000, text: "Reviewing & scoring quality..." },
+  { after: 70_000, text: "Polishing the final draft..." },
+  { after: 100_000, text: "Almost there, finalizing..." },
+  { after: 140_000, text: "Taking a bit longer, hang tight..." },
+];
+
+/* ─────────────────── COMPONENTS ─────────────────── */
 function Field({ label, children, full = false, hint }) {
   return (
     <label className={full ? "field full" : "field"}>
@@ -172,9 +160,7 @@ function SelectField({ label, value, onChange, items }) {
     <Field label={label}>
       <select value={value} onChange={(e) => onChange(e.target.value)}>
         {items.map((v) => (
-          <option key={v} value={v}>
-            {v}
-          </option>
+          <option key={v} value={v}>{v}</option>
         ))}
       </select>
     </Field>
@@ -184,35 +170,24 @@ function SelectField({ label, value, onChange, items }) {
 function MultiSelectField({ label, values, onChange, items, max = 3, hint, full = false }) {
   const toggle = (item) => {
     const isActive = values.includes(item);
-
     if (isActive) {
       onChange(values.filter((v) => v !== item));
       return;
     }
-
     if (values.length >= max) return;
     onChange([...values, item]);
   };
 
-  const defaultHint =
-    max > 1
-      ? `Pick up to ${max}${values.length > 1 ? " — first pick is the primary structure" : ""}`
-      : undefined;
+  const defaultHint = max > 1
+    ? `Pick up to ${max}${values.length > 1 ? " — first pick is the primary structure" : ""}`
+    : undefined;
 
   return (
     <Field label={label} full={full} hint={hint ?? defaultHint}>
-      <div
-        style={{
-          display: "flex",
-          flexWrap: "wrap",
-          gap: "8px",
-          marginTop: "4px",
-        }}
-      >
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "4px" }}>
         {items.map((item) => {
           const active = values.includes(item);
           const disabled = !active && values.length >= max;
-
           return (
             <button
               type="button"
@@ -241,141 +216,80 @@ function MultiSelectField({ label, values, onChange, items, max = 3, hint, full 
   );
 }
 
+/* ─────────────────── DATA EXTRACTORS ─────────────────── */
 function normaliseResponse(value) {
   let data = value;
-
-  if (Array.isArray(data)) {
-    data = data[0] || {};
-  }
-
-  if (data?.data && typeof data.data === "object") {
-    data = data.data;
-  }
-
-  if (data?.result && typeof data.result === "object") {
-    data = data.result;
-  }
-
+  if (Array.isArray(data)) data = data[0] || {};
+  if (data?.data && typeof data.data === "object") data = data.data;
+  if (data?.result && typeof data.result === "object") data = data.result;
   return data || {};
 }
 
 function getScriptData(value) {
   const data = normaliseResponse(value);
-
-  if (data.script && typeof data.script === "object") {
-    return data.script;
-  }
-
+  if (data.script && typeof data.script === "object") return data.script;
   if (data.output && typeof data.output === "object") {
-    if (data.output.script && typeof data.output.script === "object") {
-      return data.output.script;
-    }
+    if (data.output.script && typeof data.output.script === "object") return data.output.script;
     return data.output;
   }
-
   return data;
 }
 
 function getFullScript(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
-
   const candidates = [
-    script?.fullScript,
-    script?.finalText,
-    script?.script,
-    script?.full_script,
-    script?.scriptText,
-    data?.fullScript,
-    data?.finalText,
-    data?.script,
-    data?.full_script,
-    data?.output?.script?.fullScript,
-    data?.output?.script?.finalText,
-    data?.output?.fullScript,
-    data?.output?.finalText,
+    script?.fullScript, script?.finalText, script?.script, script?.full_script,
+    script?.scriptText, data?.fullScript, data?.finalText, data?.script,
+    data?.full_script, data?.output?.script?.fullScript, data?.output?.script?.finalText,
+    data?.output?.fullScript, data?.output?.finalText,
   ];
-
   for (const item of candidates) {
-    if (typeof item === "string" && item.trim().length > 0) {
-      return item.trim();
-    }
+    if (typeof item === "string" && item.trim().length > 0) return item.trim();
   }
-
   return "";
 }
 
 function getAnalysis(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
-
   return data?.analysis || script?.analysis || {};
 }
 
 function getAlternativeHooks(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
-
   return data?.alternativeHooks || script?.alternativeHooks || [];
 }
 
 function getVisualBeats(value) {
   const data = normaliseResponse(value);
   const script = getScriptData(value);
-
   return data?.visualBeats || script?.visualBeats || [];
 }
 
 async function readResponse(response) {
   const text = await response.text();
   const contentType = response.headers.get("content-type") || "";
-
-  if (!text.trim()) {
-    return {
-      empty: true,
-      data: null,
-      contentType,
-      rawText: "",
-    };
-  }
-
-  if (
-    contentType.includes("application/json") ||
-    text.trim().startsWith("{") ||
-    text.trim().startsWith("[")
-  ) {
+  if (!text.trim()) return { empty: true, data: null, contentType, rawText: "" };
+  if (contentType.includes("application/json") || text.trim().startsWith("{") || text.trim().startsWith("[")) {
     try {
-      return {
-        empty: false,
-        data: JSON.parse(text),
-        contentType,
-        rawText: text,
-      };
+      return { empty: false, data: JSON.parse(text), contentType, rawText: text };
     } catch {
-      throw new Error(
-        "n8n returned invalid JSON. Check the Respond to Webhook node Response Body."
-      );
+      throw new Error("n8n returned invalid JSON. Check the Respond to Webhook node Response Body.");
     }
   }
-
-  return {
-    empty: false,
-    data: null,
-    contentType,
-    rawText: text,
-  };
+  return { empty: false, data: null, contentType, rawText: text };
 }
 
 function downloadBlob(blob, fileName) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-
   a.href = url;
   a.download = fileName;
   document.body.appendChild(a);
   a.click();
   a.remove();
-
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
@@ -383,6 +297,21 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function friendlyError(err) {
+  const msg = err?.message || "Request failed.";
+  if (err?.name === "AbortError" || msg.includes("abort") || msg.includes("timed out")) {
+    return "Request timed out — the server is taking too long. Try reducing Research to 'Off' or Trends to 'Off' for faster results, then try again.";
+  }
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("network")) {
+    return "Network error — could not reach the server. Check your internet connection and that the n8n webhook is running, then try again.";
+  }
+  if (msg.includes("502") || msg.includes("503") || msg.includes("504")) {
+    return "Server is temporarily unavailable (502/503/504). Wait a moment and try again.";
+  }
+  return msg;
+}
+
+/* ─────────────────── MAIN APP ─────────────────── */
 export default function App() {
   const [mode, setMode] = useState("manual");
   const [form, setForm] = useState(defaults);
@@ -392,23 +321,44 @@ export default function App() {
   const [result, setResult] = useState(null);
   const [bulkDone, setBulkDone] = useState(false);
   const [bulkProgress, setBulkProgress] = useState(null);
+  const [progressText, setProgressText] = useState("");
   const pollAbortRef = useRef(false);
   const submitInFlightRef = useRef(false);
+  const progressTimerRef = useRef(null);
 
   useEffect(() => {
     return () => {
       pollAbortRef.current = true;
+      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     };
   }, []);
 
-  const set = (key, value) =>
-    setForm((prev) => ({
-      ...prev,
-      [key]: value,
-    }));
-
+  const set = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
   const valid = useMemo(() => Boolean(WEBHOOK_URL.trim()), []);
 
+  /* ── Progress stage tracker ── */
+  const startProgress = useCallback(() => {
+    const startedAt = Date.now();
+    setProgressText(PROGRESS_STAGES[0].text);
+    progressTimerRef.current = setInterval(() => {
+      const elapsed = Date.now() - startedAt;
+      let currentStage = PROGRESS_STAGES[0];
+      for (const stage of PROGRESS_STAGES) {
+        if (elapsed >= stage.after) currentStage = stage;
+      }
+      setProgressText(currentStage.text);
+    }, 2_000);
+  }, []);
+
+  const stopProgress = useCallback(() => {
+    if (progressTimerRef.current) {
+      clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+    setProgressText("");
+  }, []);
+
+  /* ─────────── MANUAL GENERATION ─────────── */
   const runManual = async () => {
     if (submitInFlightRef.current) return;
     submitInFlightRef.current = true;
@@ -422,25 +372,21 @@ export default function App() {
       setError("Set VITE_N8N_WEBHOOK_URL in frontend/.env first.");
       return;
     }
-
     if (!form.idea.trim()) {
       submitInFlightRef.current = false;
       setError("Idea is required.");
       return;
     }
-
     if (!Array.isArray(form.niche) || form.niche.length === 0) {
       submitInFlightRef.current = false;
       setError("Pick at least one Niche.");
       return;
     }
-
     if (!Array.isArray(form.scriptStyle) || form.scriptStyle.length === 0) {
       submitInFlightRef.current = false;
       setError("Pick at least one Script Style.");
       return;
     }
-
     if (!Array.isArray(form.creatorPersonality) || form.creatorPersonality.length === 0) {
       submitInFlightRef.current = false;
       setError("Pick at least one Creator Personality.");
@@ -448,135 +394,100 @@ export default function App() {
     }
 
     setLoading(true);
+    startProgress();
 
     try {
-      const response = await fetch(WEBHOOK_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
+      const response = await fetchWithRetry(
+        WEBHOOK_URL,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ inputMode: "manual", request: form }),
         },
-        body: JSON.stringify({
-          inputMode: "manual",
-          request: form,
-        }),
-      });
+        MANUAL_TIMEOUT_MS,
+        2
+      );
 
       const parsed = await readResponse(response);
 
       if (!response.ok) {
-        const serverMessage =
-          parsed.data?.error ||
-          parsed.data?.message ||
-          `Request failed (${response.status}).`;
-
+        const serverMessage = parsed.data?.error || parsed.data?.message || `Request failed (${response.status}).`;
         throw new Error(serverMessage);
       }
-
       if (parsed.empty) {
-        throw new Error(
-          "n8n returned an empty response. In the Respond to Webhook node, set Respond With = JSON and return the script JSON."
-        );
+        throw new Error("n8n returned an empty response. In the Respond to Webhook node, set Respond With = JSON and return the script JSON.");
       }
-
       if (!parsed.data) {
-        throw new Error(
-          "n8n did not return JSON. Check the Respond to Webhook node."
-        );
+        throw new Error("n8n did not return JSON. Check the Respond to Webhook node.");
       }
 
       const normalised = normaliseResponse(parsed.data);
-
-      if (
-        normalised.success === false ||
-        normalised.status === "error"
-      ) {
-        throw new Error(
-          normalised.error ||
-            normalised.message ||
-            "Script generation failed in n8n."
-        );
+      if (normalised.success === false || normalised.status === "error") {
+        throw new Error(normalised.error || normalised.message || "Script generation failed in n8n.");
       }
 
       const fullScript = getFullScript(parsed.data);
-
       if (!fullScript) {
-        throw new Error(
-          "n8n responded successfully, but no fullScript/finalText was found in the response."
-        );
+        throw new Error("n8n responded successfully, but no fullScript/finalText was found in the response.");
       }
 
       setResult(parsed.data);
     } catch (e) {
-      setError(e?.message || "Request failed.");
+      setError(friendlyError(e));
     } finally {
       setLoading(false);
+      stopProgress();
       submitInFlightRef.current = false;
     }
   };
 
+  /* ─────────── BULK POLLING ─────────── */
   const pollBulkJob = async (jobId) => {
     const startedAt = Date.now();
     pollAbortRef.current = false;
-
     let attempt = 0;
     let consecutiveNetworkFailures = 0;
 
     while (!pollAbortRef.current) {
       if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
-        throw new Error(
-          "Timed out waiting for bulk generation. The job may still be running in n8n."
-        );
+        throw new Error("Timed out waiting for bulk generation. The job may still be running in n8n.");
       }
-
       attempt += 1;
       await sleep(pollIntervalForAttempt(attempt));
 
-      let statusResponse;
-      let parsed;
-
+      let statusResponse, parsed;
       try {
         statusResponse = await fetchWithTimeout(
           `${STATUS_URL}?jobId=${encodeURIComponent(jobId)}`,
-          {
-            method: "GET",
-            headers: { Accept: "application/json" },
-            cache: "no-store",
-          }
+          { method: "GET", headers: { Accept: "application/json" }, cache: "no-store" }
         );
-
         parsed = await readResponse(statusResponse);
         consecutiveNetworkFailures = 0;
       } catch {
         consecutiveNetworkFailures += 1;
-
-        if (consecutiveNetworkFailures >= MAX_NETWORK_RETRIES_PER_POLL) {
-          setBulkProgress((previous) => ({
-            totalRows: previous?.totalRows || 0,
+        if (consecutiveNetworkFailures >= MAX_NETWORK_RETRIES) {
+          setBulkProgress((prev) => ({
+            totalRows: prev?.totalRows || 0,
             status: "processing",
             networkWarning: true,
           }));
         }
-
         continue;
       }
 
-      if (!statusResponse.ok || parsed.empty || !parsed.data) {
-        continue;
-      }
+      if (!statusResponse.ok || parsed.empty || !parsed.data) continue;
 
       const data = normaliseResponse(parsed.data);
       const elapsed = Date.now() - startedAt;
 
       if (data.success === false) {
         if (elapsed < JOB_LOOKUP_GRACE_MS || data.retryable) {
-          setBulkProgress((previous) => ({
-            totalRows: previous?.totalRows || data.totalRows || 0,
+          setBulkProgress((prev) => ({
+            totalRows: prev?.totalRows || data.totalRows || 0,
             status: "processing",
           }));
           continue;
         }
-
         throw new Error(data.error || "Bulk job could not be found.");
       }
 
@@ -585,15 +496,11 @@ export default function App() {
         status: data.status || "processing",
       });
 
-      if (String(data.status || "").toLowerCase() === "completed") {
-        return data;
-      }
-
+      if (String(data.status || "").toLowerCase() === "completed") return data;
       if (String(data.status || "").toLowerCase() === "failed") {
         throw new Error(data.error || "Bulk generation failed in n8n.");
       }
     }
-
     throw new Error("Polling was cancelled.");
   };
 
@@ -611,53 +518,38 @@ export default function App() {
           headers: { Accept: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, application/octet-stream" },
           cache: "no-store",
         },
-        60000
+        60_000
       );
     } catch {
-      throw new Error(
-        "Could not reach n8n to download the file (connection timed out or was blocked)."
-      );
+      throw new Error("Could not reach n8n to download the file (connection timed out or was blocked).");
     }
 
     if (!response.ok) {
       let message = `Download failed (${response.status}).`;
-
       try {
         const parsed = await readResponse(response);
         const data = normaliseResponse(parsed.data);
         message = data?.error || data?.message || message;
-      } catch {
-        // Keep HTTP error message
-      }
-
+      } catch { /* keep HTTP error */ }
       throw new Error(message);
     }
 
     const blob = await response.blob();
-
-    if (!blob.size) {
-      throw new Error("n8n returned an empty XLSX file.");
-    }
+    if (!blob.size) throw new Error("n8n returned an empty XLSX file.");
 
     let fileName = job.fileName || "script-results.xlsx";
     const disposition = response.headers.get("content-disposition") || "";
-
     const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     const plainMatch = disposition.match(/filename="?([^";]+)"?/i);
-
     if (utf8Match?.[1]) {
-      try {
-        fileName = decodeURIComponent(utf8Match[1]);
-      } catch {
-        fileName = utf8Match[1];
-      }
+      try { fileName = decodeURIComponent(utf8Match[1]); } catch { fileName = utf8Match[1]; }
     } else if (plainMatch?.[1]) {
       fileName = plainMatch[1];
     }
-
     downloadBlob(blob, fileName);
   };
 
+  /* ─────────── BULK GENERATION ─────────── */
   const runBulk = async () => {
     if (submitInFlightRef.current) return;
     submitInFlightRef.current = true;
@@ -672,13 +564,11 @@ export default function App() {
       setError("Set VITE_N8N_WEBHOOK_URL in frontend/.env first.");
       return;
     }
-
     if (!file) {
       submitInFlightRef.current = false;
       setError("Choose a CSV or XLSX file.");
       return;
     }
-
     const lowerName = file.name.toLowerCase();
     if (!lowerName.endsWith(".csv") && !lowerName.endsWith(".xlsx")) {
       submitInFlightRef.current = false;
@@ -690,68 +580,42 @@ export default function App() {
 
     try {
       const fd = new FormData();
-
       fd.append("inputMode", "bulk");
       fd.append("bulkDefaultSaveScriptTo", form.saveScriptTo);
       fd.append("file", file, file.name);
 
-      const response = await fetch(WEBHOOK_URL, {
-        method: "POST",
-        body: fd,
-        headers: {
-          Accept: "application/json",
-        },
-      });
+      const response = await fetchWithRetry(
+        WEBHOOK_URL,
+        { method: "POST", body: fd, headers: { Accept: "application/json" } },
+        60_000,
+        2
+      );
 
       const parsed = await readResponse(response);
-
       if (!response.ok) {
         const data = normaliseResponse(parsed.data);
-        const message =
-          data?.error ||
-          data?.message ||
-          `Bulk request failed (${response.status}).`;
-        throw new Error(message);
+        throw new Error(data?.error || data?.message || `Bulk request failed (${response.status}).`);
       }
-
       if (parsed.empty || !parsed.data) {
-        throw new Error(
-          "n8n returned an empty response when starting the bulk job."
-        );
+        throw new Error("n8n returned an empty response when starting the bulk job.");
       }
 
       const startData = normaliseResponse(parsed.data);
-
-      if (startData.success === false) {
-        throw new Error(
-          startData.error || "n8n rejected the bulk request."
-        );
-      }
+      if (startData.success === false) throw new Error(startData.error || "n8n rejected the bulk request.");
 
       const jobId = startData.jobId;
-
-      if (!jobId) {
-        throw new Error("n8n did not return a jobId.");
-      }
-
+      if (!jobId) throw new Error("n8n did not return a jobId.");
       if (String(startData.status || "").toLowerCase() === "failed") {
-        throw new Error(
-          startData.error || "Bulk generation failed before it could start."
-        );
+        throw new Error(startData.error || "Bulk generation failed before it could start.");
       }
 
-      setBulkProgress({
-        totalRows: Number(startData.totalRows || 0),
-        status: "processing",
-      });
-
+      setBulkProgress({ totalRows: Number(startData.totalRows || 0), status: "processing" });
       const finalStatus = await pollBulkJob(jobId);
       await downloadBulkResult(finalStatus);
-
       setBulkDone(true);
       setBulkProgress(null);
     } catch (e) {
-      setError(e?.message || "Bulk request failed.");
+      setError(friendlyError(e));
     } finally {
       setLoading(false);
       setBulkProgress(null);
@@ -759,35 +623,26 @@ export default function App() {
     }
   };
 
+  /* ─────────── COPY / DOWNLOAD ─────────── */
   const copyScript = async () => {
     const text = getFullScript(result);
-
     if (!text) return;
-
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      setError("Could not copy the script.");
-    }
+    try { await navigator.clipboard.writeText(text); } catch { setError("Could not copy the script."); }
   };
 
   const downloadTxt = () => {
     const text = getFullScript(result);
-
     if (!text) return;
-
-    const blob = new Blob([text], {
-      type: "text/plain;charset=utf-8",
-    });
-
-    downloadBlob(blob, "script.txt");
+    downloadBlob(new Blob([text], { type: "text/plain;charset=utf-8" }), "script.txt");
   };
 
+  /* ─────────── DERIVED DATA ─────────── */
   const analysis = getAnalysis(result);
   const alternativeHooks = getAlternativeHooks(result);
   const visualBeats = getVisualBeats(result);
   const fullScript = getFullScript(result);
 
+  /* ─────────── RENDER ─────────── */
   return (
     <div className="app">
       <div className="reel-rail reel-rail-left" aria-hidden="true" />
@@ -795,26 +650,19 @@ export default function App() {
 
       <header className="hero">
         <div className="marquee" aria-hidden="true" />
-
         <div className="hero-top">
           <div>
             <div className="eyebrow">
               <span className="eyebrow-dot" />
               AI Script Studio
             </div>
-
             <h1>
               Ready-to-record scripts,
               <br />
               without the <span className="hl">form clutter.</span>
             </h1>
-
-            <p>
-              Use the same AI engine manually or generate multiple
-              scripts from one spreadsheet.
-            </p>
+            <p>Use the same AI engine manually or generate multiple scripts from one spreadsheet.</p>
           </div>
-
           <div className="status-chip" title={valid ? "Webhook URL configured" : "Webhook URL missing"}>
             <span className={"api-dot " + (valid ? "ok" : "bad")} />
             {valid ? "LIVE" : "OFFLINE"}
@@ -824,26 +672,11 @@ export default function App() {
 
       <main className="shell">
         <div className="mode-tabs">
-          <button
-            className={mode === "manual" ? "active" : ""}
-            onClick={() => {
-              setMode("manual");
-              setError("");
-            }}
-          >
-            <span className="tab-index">01</span>
-            Manual Script
+          <button className={mode === "manual" ? "active" : ""} onClick={() => { setMode("manual"); setError(""); }}>
+            <span className="tab-index">01</span> Manual Script
           </button>
-
-          <button
-            className={mode === "bulk" ? "active" : ""}
-            onClick={() => {
-              setMode("bulk");
-              setError("");
-            }}
-          >
-            <span className="tab-index">02</span>
-            Bulk Spreadsheet
+          <button className={mode === "bulk" ? "active" : ""} onClick={() => { setMode("bulk"); setError(""); }}>
+            <span className="tab-index">02</span> Bulk Spreadsheet
           </button>
         </div>
 
@@ -854,23 +687,30 @@ export default function App() {
           </div>
         )}
 
+        {loading && progressText && mode === "manual" && (
+          <div className="alert info">
+            <span className="alert-icon"><span className="mini-spinner" /></span>
+            {progressText}
+          </div>
+        )}
+
         {bulkProgress && (
           <div className="alert info">
-            <span className="alert-icon">
-              <span className="mini-spinner" />
-            </span>
-            Generating{" "}
-            {bulkProgress.totalRows ? bulkProgress.totalRows : ""} script
-            {bulkProgress.totalRows === 1 ? "" : "s"}... this can take a
-            few minutes for larger sheets.
+            <span className="alert-icon"><span className="mini-spinner" /></span>
+            Generating {bulkProgress.totalRows ? bulkProgress.totalRows : ""} script
+            {bulkProgress.totalRows === 1 ? "" : "s"}... this can take a few minutes for larger sheets.
+            {bulkProgress.networkWarning && (
+              <span style={{ display: "block", marginTop: 4, fontSize: 12, opacity: 0.8 }}>
+                ⚠ Network issues detected — still trying...
+              </span>
+            )}
           </div>
         )}
 
         {bulkDone && (
           <div className="alert success">
             <span className="alert-icon">✓</span>
-            All available rows were processed. Your{" "}
-            <b>script-results.xlsx</b> download has started.
+            All available rows were processed. Your <b>script-results.xlsx</b> download has started.
           </div>
         )}
 
@@ -878,24 +718,12 @@ export default function App() {
           <>
             <section className="card">
               <div className="section-title">
-                <span className="slate">SCENE 01</span>
-                Script brief
+                <span className="slate">SCENE 01</span> Script brief
               </div>
 
               <div className="grid">
-                <SelectField
-                  label="What do you want to do?"
-                  value={form.intent}
-                  onChange={(v) => set("intent", v)}
-                  items={options.intent}
-                />
-
-                <SelectField
-                  label="Content Type"
-                  value={form.contentType}
-                  onChange={(v) => set("contentType", v)}
-                  items={options.contentType}
-                />
+                <SelectField label="What do you want to do?" value={form.intent} onChange={(v) => set("intent", v)} items={options.intent} />
+                <SelectField label="Content Type" value={form.contentType} onChange={(v) => set("contentType", v)} items={options.contentType} />
 
                 <MultiSelectField
                   label="Niche"
@@ -904,73 +732,28 @@ export default function App() {
                   items={options.niche}
                   max={NICHE_MAX}
                   full
-                  hint="Pick as many as you want"
+                  hint="Pick as many as you want — they blend together"
                 />
 
                 <Field label="Idea" full>
-                  <textarea
-                    value={form.idea}
-                    onChange={(e) =>
-                      set("idea", e.target.value)
-                    }
-                    placeholder="Drop your idea here..."
-                  />
+                  <textarea value={form.idea} onChange={(e) => set("idea", e.target.value)} placeholder="Drop your idea here..." />
                 </Field>
 
                 {form.intent === "Rewrite Existing Script" && (
-                  <Field
-                    label="Existing Script (only if improving / rewriting)"
-                    full
-                  >
+                  <Field label="Existing Script (only if improving / rewriting)" full>
                     <textarea
                       value={form.existingScript}
-                      onChange={(e) =>
-                        set(
-                          "existingScript",
-                          e.target.value
-                        )
-                      }
+                      onChange={(e) => set("existingScript", e.target.value)}
                       placeholder="Paste the script you want to improve..."
                     />
                   </Field>
                 )}
 
-                <SelectField
-                  label="Platform"
-                  value={form.platform}
-                  onChange={(v) => set("platform", v)}
-                  items={options.platform}
-                />
-
-                <SelectField
-                  label="Duration"
-                  value={form.duration}
-                  onChange={(v) => set("duration", v)}
-                  items={options.duration}
-                />
-
-                <SelectField
-                  label="Target Audience"
-                  value={form.targetAudience}
-                  onChange={(v) =>
-                    set("targetAudience", v)
-                  }
-                  items={options.targetAudience}
-                />
-
-                <SelectField
-                  label="Market"
-                  value={form.market}
-                  onChange={(v) => set("market", v)}
-                  items={options.market}
-                />
-
-                <SelectField
-                  label="Language"
-                  value={form.language}
-                  onChange={(v) => set("language", v)}
-                  items={options.language}
-                />
+                <SelectField label="Platform" value={form.platform} onChange={(v) => set("platform", v)} items={options.platform} />
+                <SelectField label="Duration" value={form.duration} onChange={(v) => set("duration", v)} items={options.duration} />
+                <SelectField label="Target Audience" value={form.targetAudience} onChange={(v) => set("targetAudience", v)} items={options.targetAudience} />
+                <SelectField label="Market" value={form.market} onChange={(v) => set("market", v)} items={options.market} />
+                <SelectField label="Language" value={form.language} onChange={(v) => set("language", v)} items={options.language} />
 
                 <MultiSelectField
                   label="Script Style"
@@ -979,10 +762,9 @@ export default function App() {
                   items={options.scriptStyle}
                   max={SCRIPT_STYLE_MAX}
                   full
-                  hint={
-                    form.scriptStyle.length > 1
-                      ? "1st = main structure, others = blended in as a technique"
-                      : "Pick as many as you want — 1st is the main structure"
+                  hint={form.scriptStyle.length > 1
+                    ? "1st = main structure, others = blended in as a technique"
+                    : "Pick as many as you want — 1st is the main structure"
                   }
                 />
 
@@ -993,61 +775,17 @@ export default function App() {
                   items={options.creatorPersonality}
                   max={CREATOR_PERSONALITY_MAX}
                   full
-                  hint="Pick as many as you want"
+                  hint="Pick as many as you want — they blend into one voice"
                 />
 
-                <SelectField
-                  label="Tone"
-                  value={form.tone}
-                  onChange={(v) => set("tone", v)}
-                  items={options.tone}
-                />
-
-                <SelectField
-                  label="Energy"
-                  value={form.energy}
-                  onChange={(v) => set("energy", v)}
-                  items={options.energy}
-                />
-
-                <SelectField
-                  label="Alternative Hooks & Visual Ideas"
-                  value={form.showAlternatives}
-                  onChange={(v) =>
-                    set("showAlternatives", v)
-                  }
-                  items={options.yesNo}
-                />
-
-                <SelectField
-                  label="Current Trends"
-                  value={form.currentTrends}
-                  onChange={(v) =>
-                    set("currentTrends", v)
-                  }
-                  items={options.trend}
-                />
-
-                <SelectField
-                  label="Research"
-                  value={form.research}
-                  onChange={(v) =>
-                    set("research", v)
-                  }
-                  items={options.research}
-                />
+                <SelectField label="Tone" value={form.tone} onChange={(v) => set("tone", v)} items={options.tone} />
+                <SelectField label="Energy" value={form.energy} onChange={(v) => set("energy", v)} items={options.energy} />
+                <SelectField label="Alternative Hooks & Visual Ideas" value={form.showAlternatives} onChange={(v) => set("showAlternatives", v)} items={options.yesNo} />
+                <SelectField label="Current Trends" value={form.currentTrends} onChange={(v) => set("currentTrends", v)} items={options.trend} />
+                <SelectField label="Research" value={form.research} onChange={(v) => set("research", v)} items={options.research} />
 
                 <Field label="Reference Video URL">
-                  <input
-                    value={form.referenceVideoUrl}
-                    onChange={(e) =>
-                      set(
-                        "referenceVideoUrl",
-                        e.target.value
-                      )
-                    }
-                    placeholder="https://..."
-                  />
+                  <input value={form.referenceVideoUrl} onChange={(e) => set("referenceVideoUrl", e.target.value)} placeholder="https://..." />
                 </Field>
 
                 <MultiSelectField
@@ -1059,33 +797,13 @@ export default function App() {
                 />
 
                 <Field label="Reference Transcript" full>
-                  <textarea
-                    value={form.referenceTranscript}
-                    onChange={(e) =>
-                      set(
-                        "referenceTranscript",
-                        e.target.value
-                      )
-                    }
-                    placeholder="Optional transcript..."
-                  />
+                  <textarea value={form.referenceTranscript} onChange={(e) => set("referenceTranscript", e.target.value)} placeholder="Optional transcript..." />
                 </Field>
 
-                <SelectField
-                  label="Save Script To"
-                  value={form.saveScriptTo}
-                  onChange={(v) =>
-                    set("saveScriptTo", v)
-                  }
-                  items={options.saveTo}
-                />
+                <SelectField label="Save Script To" value={form.saveScriptTo} onChange={(v) => set("saveScriptTo", v)} items={options.saveTo} />
               </div>
 
-              <button
-                className="primary"
-                onClick={runManual}
-                disabled={loading}
-              >
+              <button className="primary" onClick={runManual} disabled={loading}>
                 {loading && <span className="spinner" />}
                 {loading ? "Generating..." : "Generate Script"}
               </button>
@@ -1096,26 +814,15 @@ export default function App() {
                 <div className="result-head">
                   <div>
                     <div className="section-title">
-                      <span className="slate">TAKE 01</span>
-                      Generated script
+                      <span className="slate">TAKE 01</span> Generated script
                     </div>
-
                     <div className="score-row">
-                      <div
-                        className="score-ring"
-                        style={{
-                          "--pct": Math.min(
-                            100,
-                            Math.max(0, analysis?.overallScore ?? 0)
-                          ),
-                        }}
-                      >
+                      <div className="score-ring" style={{ "--pct": Math.min(100, Math.max(0, analysis?.overallScore ?? 0)) }}>
                         <span>{analysis?.overallScore ?? 0}</span>
                       </div>
                       <span className="muted">out of 100</span>
                     </div>
                   </div>
-
                   <div className="actions">
                     <button onClick={copyScript}>Copy Script</button>
                     <button onClick={downloadTxt}>Download TXT</button>
@@ -1131,7 +838,6 @@ export default function App() {
                 {alternativeHooks.length > 0 && (
                   <div className="sub-card">
                     <div className="label">ALTERNATIVE HOOKS</div>
-
                     {alternativeHooks.map((x, i) => (
                       <div className="line-item" key={i}>
                         <span className="line-num">{i + 1}</span> {x}
@@ -1143,7 +849,6 @@ export default function App() {
                 {visualBeats.length > 0 && (
                   <div className="sub-card">
                     <div className="label">VISUAL IDEAS</div>
-
                     {visualBeats.map((x, i) => (
                       <div className="line-item" key={i}>
                         <b>{x?.line || ""}</b>
@@ -1158,40 +863,21 @@ export default function App() {
         ) : (
           <section className="card">
             <div className="section-title">
-              <span className="slate">SCENE 02</span>
-              Bulk generation
+              <span className="slate">SCENE 02</span> Bulk generation
             </div>
-
-            <p className="muted">
-              Upload a CSV or XLSX where each row is one script request.
-            </p>
+            <p className="muted">Upload a CSV or XLSX where each row is one script request.</p>
 
             <div className="upload">
-              <input
-                id="file"
-                type="file"
-                accept=".csv,.xlsx"
-                onChange={(e) => setFile(e.target.files?.[0] || null)}
-              />
-
+              <input id="file" type="file" accept=".csv,.xlsx" onChange={(e) => setFile(e.target.files?.[0] || null)} />
               <label htmlFor="file">
-                <span className="upload-icon" aria-hidden="true">
-                  ⏏
-                </span>
+                <span className="upload-icon" aria-hidden="true">⏏</span>
                 {file ? file.name : "Choose CSV or XLSX"}
               </label>
             </div>
 
-            <SelectField
-              label="Default Save Script To"
-              value={form.saveScriptTo}
-              onChange={(v) => set("saveScriptTo", v)}
-              items={options.saveTo}
-            />
+            <SelectField label="Default Save Script To" value={form.saveScriptTo} onChange={(v) => set("saveScriptTo", v)} items={options.saveTo} />
 
-            <div className="bulk-note">
-              <b>Minimum column:</b> Idea
-            </div>
+            <div className="bulk-note"><b>Minimum column:</b> Idea</div>
 
             <button className="primary" onClick={runBulk} disabled={loading}>
               {loading && <span className="spinner" />}
