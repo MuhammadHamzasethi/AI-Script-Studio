@@ -127,6 +127,13 @@ const options = {
   saveTo: ["Abdul Hadi", "Taabish", "Random Account"],
 };
 
+// Script Style is multi-select: the first pick is the structural backbone,
+// a second pick (optional) is blended in as a technique/device only.
+const SCRIPT_STYLE_MAX = 2;
+// Reference Analysis Focus is multi-select so more than one lens (e.g. Hook + CTA)
+// can be requested when analysing a reference video.
+const REFERENCE_FOCUS_MAX = 3;
+
 const defaults = {
   intent: "Create New Script",
   contentType: "Instagram Reel",
@@ -138,7 +145,7 @@ const defaults = {
   targetAudience: "Gen Z",
   market: "Pakistan",
   language: "Natural Pakistani Roman Urdu + English",
-  scriptStyle: "Educational",
+  scriptStyle: ["Educational"],
   creatorPersonality: "Funny/Sarcastic",
   tone: "Casual",
   energy: "High",
@@ -147,7 +154,7 @@ const defaults = {
   research: "Basic",
   referenceVideoUrl: "",
   referenceTranscript: "",
-  referenceAnalysisFocus: "Hook",
+  referenceAnalysisFocus: ["Hook"],
   saveScriptTo: "Abdul Hadi",
 };
 
@@ -171,6 +178,70 @@ function SelectField({ label, value, onChange, items }) {
           </option>
         ))}
       </select>
+    </Field>
+  );
+}
+
+// Chip-style multi-select. Values is always an array. Enforces a max pick count
+// (silently ignores further clicks once the cap is hit) and always keeps at
+// least one item selected once the user has picked one, up to the caller to
+// validate a fully-empty state before submit.
+function MultiSelectField({ label, values, onChange, items, max = 3, hint, full = false }) {
+  const toggle = (item) => {
+    const isActive = values.includes(item);
+
+    if (isActive) {
+      onChange(values.filter((v) => v !== item));
+      return;
+    }
+
+    if (values.length >= max) return;
+    onChange([...values, item]);
+  };
+
+  const defaultHint =
+    max > 1
+      ? `Pick up to ${max}${values.length > 1 ? " — first pick is the primary structure" : ""}`
+      : undefined;
+
+  return (
+    <Field label={label} full={full} hint={hint ?? defaultHint}>
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          gap: "8px",
+          marginTop: "4px",
+        }}
+      >
+        {items.map((item) => {
+          const active = values.includes(item);
+          const disabled = !active && values.length >= max;
+
+          return (
+            <button
+              type="button"
+              key={item}
+              onClick={() => toggle(item)}
+              disabled={disabled}
+              style={{
+                padding: "6px 12px",
+                borderRadius: "999px",
+                border: active ? "1px solid #7c5cff" : "1px solid #3a3a4a",
+                background: active ? "#7c5cff" : "transparent",
+                color: active ? "#fff" : disabled ? "#666" : "#ddd",
+                fontSize: "13px",
+                cursor: disabled ? "not-allowed" : "pointer",
+                opacity: disabled ? 0.5 : 1,
+                transition: "all 0.15s ease",
+              }}
+            >
+              {active && values.length > 1 ? `${values.indexOf(item) + 1}. ` : ""}
+              {item}
+            </button>
+          );
+        })}
+      </div>
     </Field>
   );
 }
@@ -361,6 +432,12 @@ export default function App() {
     if (!form.idea.trim()) {
       submitInFlightRef.current = false;
       setError("Idea is required.");
+      return;
+    }
+
+    if (!Array.isArray(form.scriptStyle) || form.scriptStyle.length === 0) {
+      submitInFlightRef.current = false;
+      setError("Pick at least one Script Style.");
       return;
     }
 
@@ -886,13 +963,18 @@ export default function App() {
                   items={options.language}
                 />
 
-                <SelectField
+                <MultiSelectField
                   label="Script Style"
-                  value={form.scriptStyle}
-                  onChange={(v) =>
-                    set("scriptStyle", v)
-                  }
+                  values={form.scriptStyle}
+                  onChange={(v) => set("scriptStyle", v)}
                   items={options.scriptStyle}
+                  max={SCRIPT_STYLE_MAX}
+                  full
+                  hint={
+                    form.scriptStyle.length > 1
+                      ? "1st = main structure, 2nd = blended in as a technique"
+                      : `Pick up to ${SCRIPT_STYLE_MAX} — add a 2nd to blend two styles`
+                  }
                 />
 
                 <SelectField
@@ -958,23 +1040,13 @@ export default function App() {
                   />
                 </Field>
 
-                <Field label="Reference Analysis Focus">
-                  <select
-                    value={form.referenceAnalysisFocus}
-                    onChange={(e) =>
-                      set(
-                        "referenceAnalysisFocus",
-                        e.target.value
-                      )
-                    }
-                  >
-                    {options.referenceFocus.map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                </Field>
+                <MultiSelectField
+                  label="Reference Analysis Focus"
+                  values={form.referenceAnalysisFocus}
+                  onChange={(v) => set("referenceAnalysisFocus", v)}
+                  items={options.referenceFocus}
+                  max={REFERENCE_FOCUS_MAX}
+                />
 
                 <Field label="Reference Transcript" full>
                   <textarea
