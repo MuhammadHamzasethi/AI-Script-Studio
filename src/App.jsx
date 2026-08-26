@@ -127,9 +127,8 @@ const options = {
   saveTo: ["Abdul Hadi", "Taabish", "Random Account"],
 };
 
-// Script Style is multi-select: the first pick is the structural backbone,
-// a second pick (optional) is blended in as a technique/device only.
-const SCRIPT_STYLE_MAX = 2;
+// Script Style is multi-select: allow as many as there are options.
+const SCRIPT_STYLE_MAX = options.scriptStyle.length;
 // Reference Analysis Focus is multi-select so more than one lens (e.g. Hook + CTA)
 // can be requested when analysing a reference video.
 const REFERENCE_FOCUS_MAX = 3;
@@ -972,8 +971,8 @@ export default function App() {
                   full
                   hint={
                     form.scriptStyle.length > 1
-                      ? "1st = main structure, 2nd = blended in as a technique"
-                      : `Pick up to ${SCRIPT_STYLE_MAX} — add a 2nd to blend two styles`
+                      ? "1st = main structure, others = blended in as a technique"
+                      : "Pick as many as you want — 1st is the main structure"
                   }
                 />
 
