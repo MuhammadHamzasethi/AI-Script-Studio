@@ -82,7 +82,7 @@ const options = {
   market: ["Pakistan", "India", "Global", "Other"],
   language: [
     "Natural Pakistani Roman Urdu + English",
-    "Pure Roman Urdu + English",
+    "Pure Roman Urdu",
     "Urdu + English",
     "English",
   ],
